@@ -17,7 +17,7 @@ class PaymentStripeElements extends PaymentModule {
 	public static function getModuleInfo() {
 		return array(
 			'title' => 'Payment Stripe Elements', 
-			'version' => '1.1.0', 
+			'version' => '1.1.1', 
 			'summary' => 'PaymentStripe Elements',
 			'author' => 'Joani "flydev" Eizmendi',
 			'singular' => false,
@@ -31,7 +31,7 @@ class PaymentStripeElements extends PaymentModule {
 	public function init() {
 
 		$this->currency = strtolower($this->defaultCurrency);
-		$this->country = strtolower($this->defaultCountry);
+		$this->country = strtoupper($this->defaultCountry);
 		$this->addHookBefore('ProcessPageView::pageNotFound', function($e) {
 			$endpointUrl = trim(parse_url($this->endpointUrl)['path'], '/');
 			$currentUrl = trim($e->arguments(1), '/');
