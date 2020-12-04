@@ -1,0 +1,324 @@
+<?php namespace ProcessWire;
+
+/**
+* 
+* Stripe Elements payment method (SCA ready) for ProcessWire
+* @2019 - Heiner Gassen
+* @2020 - Eizmendi 'flydev' Joani
+* Based on PaymentStripe by Antti 'apeisa' Peisa
+* 
+* Uses Stripe Elements for payments. 
+* 
+*/
+require_once __DIR__ . '/vendor/autoload.php';
+
+class PaymentStripeElements extends PaymentModule {
+
+	public static function getModuleInfo() {
+		return array(
+			'title' => 'Payment Stripe Elements', 
+			'version' => '1.1.0', 
+			'summary' => 'PaymentStripe Elements',
+			'author' => 'Joani "flydev" Eizmendi',
+			'singular' => false,
+			'autoload' => true,
+			'requires' => 'PaymentModule',
+		);
+	}
+		
+	const STRIPE_API_VERSION = '2020-08-27';
+
+	public function init() {
+
+		$this->currency = strtolower($this->defaultCurrency);
+		$this->country = strtolower($this->defaultCountry);
+		$this->addHookBefore('ProcessPageView::pageNotFound', function($e) {
+			$endpointUrl = trim(parse_url($this->endpointUrl)['path'], '/');
+			$currentUrl = trim($e->arguments(1), '/');
+			if ($endpointUrl !== $currentUrl) {
+				return;
+			}
+
+			require_once dirname(wire('modules')->getModuleFile('PadCart')) . '/PadOrderProcess.php';
+			$payload = @file_get_contents('php://input');
+
+			if(strpos($payload, 'payment_intent') !== false) {
+
+				$endpoint_secret = $this->endpointSecret;
+				$sig_header = @$_SERVER['HTTP_STRIPE_SIGNATURE'];
+				$event = null;
+
+				try {
+					\Stripe\Stripe::setApiVersion(self::STRIPE_API_VERSION);
+					$event = \Stripe\Webhook::constructEvent($payload, $sig_header, $endpoint_secret);
+				} catch(\UnexpectedValueException $e) {
+					http_response_code(401); // Invalid payload
+					exit();
+				} catch(\Stripe\Error\SignatureVerification $e) {
+					http_response_code(402); // Invalid signature
+					exit();
+				}
+
+				if ($event->type == "payment_intent.succeeded") {
+
+					$intent = $event->data->object;
+					$order_id = $intent->metadata->order_id;
+					$user_lang = $intent->metadata->user_lang;
+					if($order = $this->getOrder($order_id)) {
+						wire('languages')->setLanguage($user_lang);
+						$this->updateOrder($order, 'PaymentStripeElements');
+						http_response_code(200);
+					} else {
+						http_response_code(403);
+					}
+					exit();
+
+				} elseif ($event->type == "payment_intent.payment_failed") {
+
+					$intent = $event->data->object;
+					$error_message = $intent->last_payment_error ? $intent->last_payment_error->message : "";
+					printf("Failed: %s, %s", $intent->id, $error_message);
+					http_response_code(200);
+					exit();
+				}
+			}
+			return;
+		}, [ 'priority' => 99 ]);
+	}
+
+	public function getTitle() {
+		return __("Stripe");
+	}
+
+	public function render() {
+
+		if ($this->getTotalAmount() <= 0) {
+			throw new WireException("Products are not set");
+		}
+		if ($this->processUrl == '') {
+			throw new WireException("processUrl is not set");
+		}
+
+		$successUrl = $this->user->language !== wire('languages')->get('default') ? $this->get('successUrl__'.$this->user->language->id) : $this->get('successUrl').'/';
+
+		$error = __('Your payment has failed. Please try again.');
+		\Stripe\Stripe::setApiVersion(self::STRIPE_API_VERSION);
+		\Stripe\Stripe::setApiKey($this->secretKey);
+		$intent = \Stripe\PaymentIntent::create([
+			'currency' => $this->currency,
+			'amount'=> $this->getTotalAmount(),
+			'metadata' => ['order_id' => $this->id, 'user_lang' =>  wire('user')->language->name, 'integration_check' => 'accept_a_payment'],
+		]);
+
+		$out = '
+			<style type="text/css">' . $this->css . '</style>
+			<script src="https://js.stripe.com/v3/"></script>
+			<div class="stripe-container">
+
+				<div class="stripe">
+
+					<div id="payment-request-button"></div>
+
+					<div>
+						<p id="label">' . __('Credit card information') . '</p>
+					</div>
+					<div>
+						<input id="cardholder-name" type="text" placeholder="' . __('Card holder name') . '">
+					</div>
+					<div id="card-element"></div>
+					<div>
+						<button id="card-button" data-secret="' . $intent->client_secret . '">' . __('Pay now') . '</button>
+					</div>
+				</div>
+			</div>
+
+			<div>
+				<img src="' . $this->config->urls->siteModules . 'PaymentStripeElements/img/powered_by_stripe.svg" alt=' . __('Powered by Stripe') . ' />
+			</div>
+
+			<script>
+
+				var stripe = Stripe("' . $this->publicKey . '");
+				stripe.api_version = "'. self::STRIPE_API_VERSION .'";
+
+				var elements = stripe.elements({
+					locale: "' . strtolower(wire('user')->language->title) . '"
+				});
+
+				/* CC */
+				var cardElement = elements.create("card");
+				cardElement.mount("#card-element");
+
+				var cardholderName = document.getElementById("cardholder-name");
+				var cardButton = document.getElementById("card-button");
+				var clientSecret = cardButton.dataset.secret;
+
+				cardButton.addEventListener("click", function(ev) {
+					stripe.handleCardPayment(
+						clientSecret, cardElement, {
+							payment_method_data: {
+								billing_details: {name: cardholderName.value}
+							}
+						}
+					).then(function(result) {
+						if (result.error) {
+							alert("' . $error . '");
+						} else {
+							window.location.href = "' . $successUrl . '?o=' . $this->id . '";
+						}
+					});
+				});
+
+				/* Payment request */
+				var paymentRequest = stripe.paymentRequest({
+					country: "' . $this->country . '",
+					currency: "' . strtolower($this->currency) . '",
+					total: {
+						label: "' . __('Total') . '",
+						amount: ' . $this->getTotalAmount() . '
+					},
+					requestPayerName: true,
+					requestPayerEmail: true
+				});
+				var prButton = elements.create("paymentRequestButton", {
+					paymentRequest: paymentRequest,
+					style: {
+						paymentRequestButton: {
+							type: "buy"
+						},
+					}
+				});
+				paymentRequest.canMakePayment().then(function(result) {
+					if (result) {
+						prButton.mount("#payment-request-button");
+					} else {
+						document.getElementById("payment-request-button").style.display = "none";
+					}
+				});
+				paymentRequest.on("paymentmethod", function(ev) {
+				  stripe.confirmCardPayment(
+				    clientSecret,
+				    {payment_method: ev.paymentMethod.id},
+				    {handleActions: false}
+				  ).then(function(confirmResult) {
+				    if (confirmResult.error) {
+				      ev.complete("fail");
+				    } else {
+				      ev.complete("success");
+				      stripe.confirmCardPayment(clientSecret).then(function(result) {
+				        if (result.error) {
+				          alert("' . $error . '");
+				        } else {
+				          window.location.href = "' . $successUrl . '?o=' . $this->id . '";
+				        }
+				      });
+				    }
+				  });
+				});
+			</script>
+		';
+		return $out;
+	}
+
+	private function getOrder($order_id) {
+
+		$order = wire('pages')->get($order_id);
+		if(!$order || !$order instanceof PadOrder) {
+			return false;
+		}
+		return $order;
+	}
+	
+	private function updateOrder($order, $payment_module_name) {
+
+		// Update order
+		$order->of(false);
+		$order->pad_paid = time();
+		$order->addNote(__("Order paid using Stripe"));
+		// Successful orders are published pages
+		$order->removeStatus(Page::statusUnpublished);
+		$order->save();
+
+		$process = new PadOrderProcess;
+		$process->setOrder($order);
+		$process->setPaymentModule($payment_module_name);
+
+		$process->completeOrder();
+		$process->sendConfirmation();
+	}
+
+	public static function getModuleConfigInputfields(array $data) {
+
+		$inputfields = new InputfieldWrapper();
+
+		$field = wire('modules')->get('InputfieldText');
+		$field->name = 'defaultCurrency';
+		$field->label = __("Default currency");
+		$field->required = true;
+		$field->notes = __("Use this currency by default");
+		if(isset($data['defaultCurrency'])) $field->value = $data['defaultCurrency'];
+		$inputfields->add($field);
+
+		$field = wire('modules')->get('InputfieldText');
+		$field->name = 'defaultCountry';
+		$field->label = __("Default country");
+		$field->required = true;
+		$field->notes = __("Use this country by default");
+		isset($data['defaultCountry']) ? $field->value = $data['defaultCountry'] : 'US';
+		$inputfields->add($field);
+
+		$field = wire('modules')->get('InputfieldText');
+		$field->name = 'secretKey';
+		$field->label = __("Secret key");
+		$field->required = true;
+		$field->placeholder = 'sk_test_ OR sk_live_ ';
+		$field->notes = __("Your secret key: remember to change this to your live secret key in production. See your keys [here](https://dashboard.stripe.com/account)");
+		if(isset($data['secretKey'])) $field->value = $data['secretKey'];
+		$inputfields->add($field);
+
+		$field = wire('modules')->get('InputfieldText');
+		$field->name = 'publicKey';
+		$field->label = __("Public key");
+		$field->required = true;
+		$field->placeholder = 'pk_test_ OR pk_live_';
+		$field->notes = __("Your public key: remember to change this to your live public key in production. See your keys [here](https://dashboard.stripe.com/account)");
+		if(isset($data['publicKey'])) $field->value = $data['publicKey'];
+		$inputfields->add($field);
+
+		$field = wire('modules')->get('InputfieldText');
+		$field->name = 'successUrl';
+		$field->label = __("Success URL");
+		$field->required = true;
+		$field->useLanguages = true;
+		$field->notes = __("After successful payment, customer is redirected to this page.");
+		if(isset($data['successUrl'])) $field->value = $data['successUrl'];
+		$inputfields->add($field);
+
+		$field = wire('modules')->get('InputfieldText');
+		$field->name = 'endpointUrl';
+		$field->label = __("Notification URL");
+		$field->required = true;
+		$field->notes = __("Complete URL of the notification endpoint. There should be no existing page at this URL, and it should be the same URL as defined [here](https://dashboard.stripe.com/webhooks)");
+		if(isset($data['endpointUrl'])) $field->value = $data['endpointUrl'];
+		$inputfields->add($field);
+
+		$field = wire('modules')->get('InputfieldText');
+		$field->name = 'endpointSecret';
+		$field->label = __("Endpoint secret");
+		$field->required = true;
+		$field->placeholder = 'whsec_';
+		$field->notes = __("Secret for the notification endpoint after payment. See you key [here](https://dashboard.stripe.com/webhooks)");
+		if(isset($data['endpointSecret'])) $field->value = $data['endpointSecret'];
+		$inputfields->add($field);
+
+		$field = wire('modules')->get('InputfieldTextarea');
+		$field->name = 'css';
+		$field->label = __("CSS for Stripe Element");
+		$field->required = true;
+		if(isset($data['css'])) $field->value = $data['css'];
+		$inputfields->add($field);
+
+
+		return $inputfields;
+	}
+}
