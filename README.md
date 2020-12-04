@@ -14,7 +14,14 @@ Use the following regulatory (3D Secure) test card numbers. The following card i
 >
 > This card requires authentication on all transactions, regardless of how the card is set up.
 
+---
 
 If you find bugs, or if you have a feature request, please head to Github and open an issue.
 
-Happy shopping again !  🤑
+---
+
+If you feel like I am saving you a lot of work, [head to paypal to say thanks](https://paypal.me/jeizmendi) 😁 🍪 🥤
+
+---
+
+Happy shopping !  🤑
